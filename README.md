@@ -143,6 +143,37 @@ left to you:
   architecture, occupied ports, too little disk: it refuses up front rather than failing
   halfway through.
 
+## Removing it, to install again
+
+There is no uninstaller. Reinstalling means taking the old one apart first, and one step is
+easy to miss:
+
+```sh
+systemctl disable --now wyvern-wings wyvernq
+rm -f /etc/systemd/system/wyvern-wings.service /etc/systemd/system/wyvernq.service
+systemctl daemon-reload
+
+mariadb -e "DROP DATABASE IF EXISTS wyvern;
+            DROP USER IF EXISTS 'wyvern'@'127.0.0.1';
+            DROP USER IF EXISTS 'wyvernhost'@'127.0.0.1';"
+
+rm -rf /var/www/wyvern /var/www/wyvern-pma /etc/wyvern /var/lib/wyvern
+rm -f  /etc/nginx/sites-{available,enabled}/wyvern.conf /etc/cron.d/wyvern
+rm -f  /etc/php/*/fpm/pool.d/wyvern.conf /root/wyvern-credentials.txt
+systemctl restart nginx php*-fpm
+
+# The step people miss. The daemon creates a docker network on the pelican0 bridge, and a
+# leftover one makes the new daemon exit on startup with "networks have same bridge name".
+docker ps -aq | xargs -r docker rm -f
+docker network ls
+docker network rm <the network whose bridge is pelican0>
+```
+
+`docker network inspect <name> --format '{{index .Options "com.docker.network.bridge.name"}}'`
+tells you which one that is; it will not necessarily be called `pelican0` itself.
+
+Then stop nginx, so the port check sees 80 free, and run the installer again.
+
 ## If something breaks
 
 ```sh

@@ -63,6 +63,7 @@ NODE_ID=""
 PANEL_URL=""
 GENERATED_ADMIN_PASS=0
 SSL_FAILED=0
+SMOKE_FAILED=0
 
 # --------------------------------------------------------------------------- output
 
@@ -540,11 +541,7 @@ install_packages() {
         docker-ce docker-ce-cli containerd.io
     ok "packages installed"
 
-    PHP_SOCK="/run/php/$PHP-fpm.sock"
-    if [ ! -S "$PHP_SOCK" ]; then
-        run systemctl restart "$PHP-fpm"
-        [ -S "$PHP_SOCK" ] || die "the php-fpm socket $PHP_SOCK is missing."
-    fi
+    setup_php_pool
 
     if [ "$USE_SSL" = "y" ]; then
         run apt-get install -y certbot python3-certbot-nginx
@@ -568,6 +565,59 @@ install_packages() {
         systemctl enable --now "$s" >>"$LOG_FILE" 2>&1 || warn "could not start $s"
     done
     ok "services running"
+}
+
+# Wyvern gets its own php-fpm pool.
+#
+# Using the distribution's default pool means inheriting whatever it has been set to. On a
+# machine where php-fpm was configured once before, that pool can run as a different user
+# than www-data — and then the panel, whose files this script chowns to www-data, cannot
+# write its own log. Laravel's failure to log an exception then throws inside the exception
+# handler, so the request dies with an empty 500 and nothing recorded anywhere: hours of
+# debugging for a one-line cause.
+#
+# A dedicated pool also carries the panel's limits. The default memory_limit of 128M is
+# below what a Filament page costs, and the fatal that produces is equally silent.
+setup_php_pool() {
+    cat >"/etc/php/${PHP#php}/fpm/pool.d/wyvern.conf" <<EOF
+; Written by wyvern-installer. The panel runs in its own pool so that neither its user
+; nor its limits depend on how the default pool happens to be configured.
+[wyvern]
+user = www-data
+group = www-data
+
+listen = /run/php/wyvern-fpm.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+
+pm = dynamic
+pm.max_children = 12
+pm.start_servers = 3
+pm.min_spare_servers = 2
+pm.max_spare_servers = 5
+pm.max_requests = 500
+
+; A Filament page does not fit in the 128M default.
+php_admin_value[memory_limit] = 512M
+php_admin_value[upload_max_filesize] = 100M
+php_admin_value[post_max_size] = 100M
+php_admin_value[max_execution_time] = 300
+
+php_admin_flag[log_errors] = on
+catch_workers_output = yes
+EOF
+
+    run systemctl restart "$PHP-fpm"
+
+    PHP_SOCK="/run/php/wyvern-fpm.sock"
+    _waited=0
+    while [ ! -S "$PHP_SOCK" ] && [ "$_waited" -lt 10 ]; do
+        sleep 1
+        _waited=$((_waited + 1))
+    done
+    [ -S "$PHP_SOCK" ] || die "the php-fpm pool did not come up ($PHP_SOCK is missing)."
+    ok "php-fpm pool 'wyvern' as www-data, 512M"
 }
 
 # --------------------------------------------------------------------------- database
@@ -1065,7 +1115,8 @@ EOF
     if systemctl is-active --quiet wyvern-wings; then
         ok "daemon running"
     else
-        warn "the daemon did not start. journalctl -u wyvern-wings -n 40"
+        warn "the daemon did not start."
+        daemon_failure_reason
     fi
 }
 
@@ -1133,6 +1184,30 @@ EOF
 
 # --------------------------------------------------------------------------- firewall
 
+# "journalctl -u wyvern-wings -n 40" is forty lines of Go stack trace with the one useful
+# sentence scrolled off the top. Print that sentence.
+daemon_failure_reason() {
+    _reason=$(journalctl -u wyvern-wings --no-pager 2>/dev/null \
+        | grep -aoE '(FATAL|ERROR): \[[^]]*\] .*' \
+        | tail -n 1 \
+        | sed 's/^[A-Z]*: \[[^]]*\] //')
+
+    if [ -n "$_reason" ]; then
+        warn "It says: $_reason"
+        case "$_reason" in
+            *"networks have same bridge name"*)
+                warn "A docker network from an earlier install is still there. Remove it:"
+                warn "  docker network ls   then   docker network rm <the one whose bridge is pelican0>"
+                ;;
+            *"connection refused"*|*"no such host"*|*"401"*)
+                warn "The daemon could not reach the panel at $PANEL_URL."
+                ;;
+        esac
+    else
+        warn "Look at: journalctl -u wyvern-wings -n 40"
+    fi
+}
+
 setup_firewall() {
     [ "$SKIP_FIREWALL" -eq 0 ] || return 0
     step "Firewall"
@@ -1165,6 +1240,67 @@ setup_firewall() {
     note "Game server ports stay closed; open each one as you create its allocation."
 }
 
+# --------------------------------------------------------------------------- smoke test
+
+# curl prints 000 of its own when it cannot connect, so `$(curl -w '%{http_code}' || echo 000)`
+# yields "000000" on failure. One source of truth instead.
+http_code() {
+    curl -s -o /dev/null -m 15 -w '%{http_code}' "$1" 2>/dev/null || true
+}
+
+# The installer once finished with a cheerful summary while every page answered 500, and
+# the daemon was failing behind it for the same reason. Finishing is not the same as
+# working, so the last thing it does is ask.
+smoke_test() {
+    step "Checking it actually works"
+
+    # Against the panel's own URL, not 127.0.0.1: the panel redirects everything to
+    # APP_URL, so asking on another host measures the redirect rather than the panel.
+    _code=$(http_code "$PANEL_URL/")
+    case "$_code" in
+        200|302)
+            ok "the panel answers ($_code)"
+            ;;
+        *)
+            warn "the panel answered $_code, not a redirect to the login page."
+            warn "Look at: tail -n 50 $PANEL_DIR/storage/logs/*.log"
+            warn "         journalctl -u $PHP-fpm -n 50"
+            SMOKE_FAILED=1
+            ;;
+    esac
+
+    # /login, not /auth/login. routes/auth.php is mounted under /auth, but the form the
+    # browser lands on is Filament's, at /login, and /auth/login merely redirects there.
+    _login=$(http_code "$PANEL_URL/login")
+    if [ "$_login" = "200" ]; then
+        ok "the login page renders"
+    else
+        warn "the login page answered $_login."
+        SMOKE_FAILED=1
+    fi
+
+    if [ "$INSTALL_PMA" = "y" ]; then
+        _pma=$(http_code "$PANEL_URL/pma/")
+        case "$_pma" in
+            302) ok "phpMyAdmin is shut to a visitor who is not signed in" ;;
+            200) warn "phpMyAdmin answered 200 while signed out — the gate is not working." ; SMOKE_FAILED=1 ;;
+            *)   warn "phpMyAdmin answered $_pma." ; SMOKE_FAILED=1 ;;
+        esac
+    fi
+
+    if [ "$SKIP_WINGS" -eq 0 ]; then
+        # 401 is the daemon refusing an unsigned request, which is the healthy answer.
+        _w=$(http_code "http://127.0.0.1:8080/api/system")
+        if [ "$_w" = "401" ]; then
+            ok "the daemon is listening and refusing unsigned requests"
+        else
+            warn "the daemon is not answering on :8080 (got ${_w:-nothing})."
+            daemon_failure_reason
+            SMOKE_FAILED=1
+        fi
+    fi
+}
+
 # --------------------------------------------------------------------------- summary
 
 summary() {
@@ -1192,7 +1328,11 @@ summary() {
     } >"$CRED_FILE"
     chmod 600 "$CRED_FILE"
 
-    printf '\n%sWyvern is installed.%s\n\n' "$C_GREEN$C_BOLD" "$C_RESET"
+    if [ "$SMOKE_FAILED" -eq 1 ]; then
+        printf '\n%sWyvern is installed, but it is not answering properly.%s\n\n' "$C_YELLOW$C_BOLD" "$C_RESET"
+    else
+        printf '\n%sWyvern is installed.%s\n\n' "$C_GREEN$C_BOLD" "$C_RESET"
+    fi
 
     printf '    Panel            %s%s%s\n' "$C_BOLD" "$PANEL_URL" "$C_RESET"
     printf '    Administrator    %s\n' "$ADMIN_USER"
@@ -1266,6 +1406,7 @@ main() {
     install_pma
     [ "$SKIP_WINGS" -eq 0 ] && install_wings
     setup_firewall
+    smoke_test
     summary
 }
 
