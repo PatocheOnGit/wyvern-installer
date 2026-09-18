@@ -1,0 +1,170 @@
+# wyvern-installer
+
+One script that turns a fresh Debian or Ubuntu VPS into a working
+[Wyvern Panel](https://github.com/PatocheOnGit/wyvern-panel-next) host: the panel, the
+[daemon](https://github.com/PatocheOnGit/wyvern-wings), a database, a cache, a web server,
+a queue worker, a scheduler, a firewall, and optionally phpMyAdmin.
+
+Wyvern is a personal project. This installer is published so its own installs are
+reproducible and auditable — not as a product. It makes large changes to a machine, so
+read it before you run it, and run it on a host you are willing to dedicate to Wyvern.
+
+```sh
+wget https://raw.githubusercontent.com/PatocheOnGit/wyvern-installer/main/install.sh
+sudo sh install.sh
+```
+
+It asks a handful of questions, then takes five to fifteen minutes depending on the VPS.
+Everything it does is logged to `/var/log/wyvern-install.log`; only decisions and failures
+reach the screen.
+
+**Do not pipe it into a shell.** `curl … | sh` leaves stdin pointing at the script itself,
+so every prompt would eat a line of code. The script detects this and refuses rather than
+misbehaving — download it, then run it.
+
+## What it needs
+
+| | |
+|---|---|
+| OS | Debian 12+ or Ubuntu 22.04+, or a derivative of either. Anything else is refused, not attempted. |
+| Init | systemd. The daemon and the queue worker are systemd units. |
+| Arch | amd64 or arm64 — the two the daemon is published for. |
+| RAM | 2 GB to be comfortable. Less works, and is warned about: the panel leaves little for game servers. |
+| Disk | 10 GB free on `/var` before the first game server. |
+| Ports | 80 and 443 free, plus 8080 and 2022 for the daemon. Checked before anything is installed. |
+| Network | Reachable `api.github.com`, where the panel and the daemon come from. |
+
+A domain already pointed at the host gets HTTPS from Let's Encrypt. An IP address gets
+HTTP, because no certificate authority will certify an IP.
+
+## Unattended
+
+Give every answer as a flag and it asks nothing:
+
+```sh
+sudo sh install.sh --unattended \
+  --fqdn panel.example.com --ssl \
+  --email you@example.com --username admin \
+  --node-name node-01 --with-pma
+```
+
+`sh install.sh --help` lists them all. With `--password` omitted, one is generated and
+written to `/root/wyvern-credentials.txt` along with every other credential.
+
+Environment variables, for the unusual cases:
+
+| | |
+|---|---|
+| `WYVERN_GITHUB_TOKEN` | Any token. Anonymous GitHub API calls are capped at 60 per hour per IP, and a busy or shared address can exhaust that before the installer starts. |
+| `WYVERN_PANEL_REPO`, `WYVERN_WINGS_REPO` | Install from a fork. |
+| `WYVERN_PANEL_DIR` | Somewhere other than `/var/www/wyvern`. |
+| `WYVERN_LOCALE` | Panel language. Defaults to `en`. |
+
+## What ends up where
+
+| | |
+|---|---|
+| Panel | `/var/www/wyvern`, owned by `www-data` |
+| Panel config | `/var/www/wyvern/.env`, mode 640 |
+| Daemon | `/usr/local/bin/wings`, config `/etc/wyvern/config.yml` |
+| Game server data | `/var/lib/wyvern/volumes` |
+| nginx | `/etc/nginx/sites-available/wyvern.conf` |
+| Queue worker | `wyvernq.service` |
+| Daemon | `wyvern-wings.service` |
+| Scheduler | `/etc/cron.d/wyvern`, every minute |
+| Credentials | `/root/wyvern-credentials.txt`, mode 600 |
+| Log | `/var/log/wyvern-install.log` |
+
+The database and the cache are the distribution's own `mariadb-server` and `redis-server`,
+both bound to `127.0.0.1`. Nothing runs in a container except game servers.
+
+Two database accounts are created. `wyvern` owns the panel's schema and nothing else.
+`wyvernhost` can create databases and users, which is what the panel's per-server database
+feature needs — register it in the admin area as a database host on `127.0.0.1:3306`, with
+the password from the credentials file. Nothing uses it until you do.
+
+### Sessions and the cache do not share a database
+
+The panel is configured with sessions on redis database 1 and the cache on database 0.
+This is not cosmetic: Laravel clears a redis cache with `FLUSHDB`, so with both on one
+database, `php artisan cache:clear` — and therefore `optimize:clear` — signs every user
+out, including whoever ran it. The panel now defaults to the separated connection, and the
+installer inherits it.
+
+## phpMyAdmin
+
+Optional, off by default, served at `/pma` on the same host as the panel.
+
+It is not protected by a password of its own. nginx asks the panel, on every request,
+whether the browser presenting these cookies is a signed-in root administrator:
+
+```
+/pma  →  nginx auth_request  →  panel /wyvern/internal/pma-authorize  →  204 or 403
+```
+
+A 403 sends the visitor to the panel's login page. So there is no second credential to
+store, rotate or leak, and phpMyAdmin is unreachable to anyone who is not already an
+administrator of this panel. The subrequest is served by the panel over the same php-fpm
+socket, so it costs no extra process and no internal HTTP hop.
+
+The endpoint lives in the panel, in `src/Http/AuthorizePhpMyAdmin.php`, and needs panel
+**0.2.0 or newer**. On an older panel the subrequest 404s, nginx reads that as a refusal,
+and `/pma` simply stays shut — closed, not open, which is the right way for that to fail.
+
+**Not implemented yet:** a link from a server's database page that signs you straight into
+phpMyAdmin as that database's own user. It is possible — phpMyAdmin's `signon` auth type
+takes credentials from a PHP script, so a one-time token minted by the panel could hand
+over the per-server user — but it needs a token store and a credential path of its own, and
+it is not in this version. Today `/pma` asks for a MySQL account once you are through the
+gate.
+
+## After it finishes
+
+The panel is up, the node is registered, the daemon is running. Two things are deliberately
+left to you:
+
+- **No eggs are imported.** Pelican ships none, and neither does this. Import from
+  [wyvern-eggs](https://github.com/PatocheOnGit/wyvern-eggs) or any
+  [pelican-eggs](https://github.com/pelican-eggs) collection from the admin area.
+- **Game server ports are not opened.** The firewall allows SSH, 80, 443, 8080 and 2022.
+  Open each game port as you create its allocation — a blanket range would be a guess at
+  what you are running.
+
+## What it will not do
+
+- **Install over an existing panel.** If `$PANEL_DIR/artisan` exists it stops. Reconciling
+  a database, an `.env` and a node token it did not create is not something a script should
+  improvise.
+- **Upgrade.** There is no `--upgrade`. Panel upgrades are `git`/tarball plus
+  `php artisan migrate --force`, and they deserve their own tool.
+- **Set up mail.** `MAIL_MAILER=log`, so password resets land in the panel's log instead of
+  a mailbox. Configure SMTP in the admin area when you need it.
+- **Touch a machine it does not understand.** Not Debian or Ubuntu, no systemd, wrong
+  architecture, occupied ports, too little disk: it refuses up front rather than failing
+  halfway through.
+
+## If something breaks
+
+```sh
+tail -n 50 /var/log/wyvern-install.log
+systemctl status wyvern-wings wyvernq nginx mariadb redis-server
+journalctl -u wyvern-wings -n 40
+```
+
+The two failures worth naming in advance:
+
+- **certbot failed.** Almost always a domain that does not point at this host yet, or a
+  filtered port 80. The install continues over HTTP and tells you the one command to run
+  afterwards.
+- **The node shows offline in the panel.** The daemon is reachable on 8080 over the scheme
+  the node was created with. If you obtained a certificate after creating the node, the
+  node is still `http` — change it in the admin area and restart `wyvern-wings`.
+
+## Licence and derivation
+
+MIT, see [`LICENSE`](LICENSE).
+
+The things it installs are derivatives themselves, and say so: the panel comes from
+[Pelican](https://pelican.dev) (AGPL-3.0), and the daemon from Pelican's Wings, itself from
+[Pterodactyl](https://pterodactyl.io) Wings (MIT). Wyvern is not affiliated with, endorsed
+by, or sponsored by either project.

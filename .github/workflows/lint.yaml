@@ -1,0 +1,22 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      # -s sh, not bash: the script has to run under dash, which is /bin/sh on Debian.
+      # Anything bash-only would work on the author's machine and fail on a fresh VPS.
+      - name: shellcheck
+        run: shellcheck -s sh install.sh
+
+      - name: POSIX syntax
+        run: sh -n install.sh
