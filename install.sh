@@ -1009,6 +1009,13 @@ install_wings() {
 
     panel_artisan_out p:node:configuration "$NODE_ID" --format=yaml >"$CONF_DIR/config.yml"
     [ -s "$CONF_DIR/config.yml" ] || die "the node configuration came back empty."
+
+    # The panel does not emit app_name, so the daemon fills in its own default — "pelican"
+    # — and then writes it back into this file on first start. It reaches operators: it is
+    # what the daemon calls itself in its logs and in the SFTP banner.
+    grep -q '^app_name:' "$CONF_DIR/config.yml" || printf 'app_name: Wyvern
+' >>"$CONF_DIR/config.yml"
+
     chmod 600 "$CONF_DIR/config.yml"
     ok "configuration written to $CONF_DIR/config.yml"
 
@@ -1223,7 +1230,12 @@ main() {
     # Prompts read from the terminal, not from stdin: piping this script into a shell
     # leaves stdin pointing at the script itself, and every read would swallow a line of
     # code.
-    if [ -r /dev/tty ]; then
+    #
+    # Testing readability is not enough: /dev/tty exists and looks readable inside a
+    # container or under `ssh host 'sh install.sh'`, and opening it still fails with
+    # ENXIO. Under set -e that aborts the script before this fallback can run, so the
+    # open is attempted in a subshell first.
+    if (exec 3</dev/tty) 2>/dev/null; then
         exec 3</dev/tty
     else
         exec 3<&0
