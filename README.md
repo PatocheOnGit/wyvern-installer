@@ -124,10 +124,32 @@ Three things follow, and each is deliberate:
 nginx still asks the panel, on every `/pma/app` request, whether the visitor is signed in at
 all. That is the outer door; the picker and the MySQL grants are what decide the rest.
 
-phpMyAdmin is skinned to the panel's colours — a Wyvern theme built from the Bootstrap one
-it ships, since every phpMyAdmin theme is compiled Bootstrap 5 with the full set of CSS
-custom properties. It is a skin, not a pixel match: phpMyAdmin has its own layout and always
-will. It is also pinned to English, which it otherwise picks from `Accept-Language`.
+### Made to look like the panel
+
+Not just darkened. The theme is built at install time from what the panel already has on
+the host:
+
+- **Its typefaces.** Instrument Sans and JetBrains Mono are copied out of the panel's build
+  — copied, not linked, because Vite names its output with a content hash that changes on
+  every rebuild.
+- **Its icons.** phpMyAdmin draws every icon as a transparent gif with the image applied by
+  a `.ic_*` class, so the whole set is replaceable in CSS. Each class becomes a mask over a
+  solid colour, generated from the same Tabler icons the panel uses, so an icon means the
+  same thing on both sides of the link. Colour follows the panel's rule: grey by default,
+  accent for the action you came to perform, red only for what destroys something.
+- **Its measurements.** 13px base, 8px cards, 6px controls, one hairline, no shadows,
+  monospaced data cells.
+
+The colours themselves are a variable override on a copy of the Bootstrap theme, since
+every phpMyAdmin theme is compiled Bootstrap 5 with the full set of `--bs-*` properties.
+
+What was left light was found by walking the DOM of phpMyAdmin's own pages and asking which
+elements actually compute to a light background or dark text — the SQL console, the query
+box, CodeMirror's purple-on-white syntax theme and a dozen black labels all survived a pass
+done by looking at screenshots. It is still a skin: phpMyAdmin's layout is its own.
+
+It is also pinned to English, which it otherwise picks from `Accept-Language`, and its logo
+links back to the picker rather than to phpmyadmin.net.
 
 This needs panel **0.3.1 or newer**. Against anything older the page does not exist and
 `/pma` simply 404s — closed, not open, which is the right way for that to fail.
@@ -156,6 +178,23 @@ left to you:
 - **Touch a machine it does not understand.** Not Debian or Ubuntu, no systemd, wrong
   architecture, occupied ports, too little disk: it refuses up front rather than failing
   halfway through.
+
+## contrib/rebind.sh
+
+Not part of the install. It points an existing panel at a different address — `APP_URL`,
+nginx's `server_name`, the node's FQDN, the daemon's config and phpMyAdmin's back-link, all
+of which are written once at install time and none of which notice when the address moves.
+
+Written for a panel on WSL, where the IP changes on most restarts, but it applies to any
+host that has moved:
+
+```sh
+sudo rebind.sh              # to whatever IP this host has now
+sudo rebind.sh localhost    # to a name that never changes
+sudo rebind.sh panel.example.com
+```
+
+It does nothing when the address is already right, so it is safe to run on every boot.
 
 ## Removing it, to install again
 

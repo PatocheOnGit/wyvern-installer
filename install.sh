@@ -906,6 +906,17 @@ nginx_pma_blocks() {
         index index.php;
         try_files \$uri \$uri/ /pma/app/index.php?\$query_string;
 
+        # The theme revalidates instead of being cached outright. phpMyAdmin versions its
+        # stylesheet with its own release number, so a Wyvern theme rebuilt under the same
+        # phpMyAdmin version is invisible to anyone who already loaded the old one — and
+        # the theme is rebuilt by every installer update. A conditional request answered
+        # with 304 costs a header; a stale theme costs a bug report.
+        location ~ ^/pma/app/themes/wyvern/ {
+            root $PMA_PARENT;
+            add_header Cache-Control "no-cache";
+            try_files \$uri =404;
+        }
+
         location ~ ^/pma/app/.+\.php\$ {
             root $PMA_PARENT;
             include fastcgi_params;
@@ -1327,6 +1338,17 @@ declare(strict_types=1);
 \$cfg['ThemeDefault'] = 'wyvern';
 \$cfg['ThemeManager'] = false;
 
+// The logo links back to the picker rather than to phpmyadmin.net. Someone who arrived
+// here from the panel has no other way back: phpMyAdmin knows nothing about Wyvern, and
+// the browser back button lands on a page that immediately redirects forward again.
+//
+// An absolute URL, because phpMyAdmin runs this through Sanitize::checkLink() and quietly
+// falls back to index.php for anything it does not recognise — a root-relative /pma
+// included. That makes this line depend on the panel's address, so wyvern rebind keeps it
+// in step.
+\$cfg['NavigationLogoLink'] = '$PANEL_URL/pma';
+\$cfg['NavigationLogoLinkWindow'] = 'main';
+
 // Otherwise phpMyAdmin picks a language from Accept-Language, and a French browser gets a
 // French phpMyAdmin bolted onto an English panel.
 \$cfg['Lang'] = 'en';
@@ -1345,13 +1367,220 @@ declare(strict_types=1);
 EOF
 }
 
+# Give the theme the panel's own typefaces.
+#
+# Copied rather than linked: Vite names its output with a content hash, so the path changes
+# every time the panel is rebuilt and a reference to it would rot. A copy is two files and
+# never breaks.
+copy_pma_fonts() {
+    _fonts="$1/fonts"
+    mkdir -p "$_fonts"
+
+    for _pair in "instrument-sans-latin-wght-normal:instrument-sans" "jetbrains-mono-latin-wght-normal:jetbrains-mono"; do
+        _src=$(find "$PANEL_DIR/public/build/assets" -name "${_pair%%:*}-*.woff2" 2>/dev/null | head -n 1)
+        [ -n "$_src" ] && cp "$_src" "$_fonts/${_pair##*:}.woff2"
+    done
+
+    [ -f "$_fonts/instrument-sans.woff2" ]
+}
+
+# Build the icon layer from the panel's own Tabler set.
+#
+# phpMyAdmin draws every icon as a transparent gif with the real image applied by a .ic_*
+# class, so the whole set can be replaced in CSS without touching its PHP. Each class
+# becomes a mask over a solid colour, which is what lets an icon take the panel's tokens
+# instead of being black line art on a dark page.
+#
+# Generated here rather than shipped: the panel is already on this host and carries the
+# Tabler SVGs the panel itself uses, so both sides of the link draw the same icon from the
+# same files — and this script stays a thing you can read instead of 80 KB of data URIs.
+build_pma_icons() {
+    _svg_dir=$(find "$PANEL_DIR/vendor" -type d -path '*tabler*' -name svg 2>/dev/null | head -n 1)
+
+    if [ -z "$_svg_dir" ]; then
+        warn "no Tabler icons in the panel's vendor directory; phpMyAdmin keeps its own."
+        return 1
+    fi
+
+    cat >"$WORK_DIR/icons.php" <<'PHPEOF'
+<?php
+
+declare(strict_types=1);
+
+// phpMyAdmin icon name => Tabler icon name.
+$map = [
+    'b_edit' => 'pencil', 'bd_edit' => 'pencil', 'b_inline_edit' => 'pencil',
+    'b_rename' => 'cursor-text', 'b_comment' => 'message', 'b_save' => 'device-floppy',
+    'b_undo' => 'arrow-back-up', 'b_move' => 'arrows-move',
+
+    'b_drop' => 'trash', 'bd_drop' => 'trash', 'b_deltbl' => 'trash',
+    'bd_deltbl' => 'trash', 'col_drop' => 'trash', 'db_drop' => 'trash',
+    'b_empty' => 'eraser', 'bd_empty' => 'eraser',
+
+    'b_browse' => 'table', 'bd_browse' => 'table', 'b_sbrowse' => 'table-row',
+    'bd_sbrowse' => 'table-row', 'b_select' => 'filter', 'bd_select' => 'filter',
+    'b_insrow' => 'row-insert-bottom', 'bd_insrow' => 'row-insert-bottom',
+    'b_column_add' => 'column-insert-right',
+
+    'b_export' => 'download', 'bd_export' => 'download', 'b_tblexport' => 'download',
+    'b_import' => 'upload', 'b_tblimport' => 'upload', 'b_saveimage' => 'photo-down',
+    'b_print' => 'printer', 'b_pdfdoc' => 'file-type-pdf',
+
+    'b_search' => 'search', 'b_find_replace' => 'replace', 'b_globe' => 'world',
+
+    'b_sql' => 'terminal-2', 'b_sqldoc' => 'file-code', 'b_sqlhelp' => 'help-circle',
+    'console' => 'terminal-2', 'php_sym' => 'brand-php',
+
+    'b_docs' => 'book', 'b_docsql' => 'book', 'b_help' => 'help-circle',
+    'b_tipp' => 'bulb', 'lightbulb' => 'bulb', 'lightbulb_off' => 'bulb-off',
+
+    'b_home' => 'home', 'window-new' => 'external-link', 'b_more' => 'dots',
+    'more' => 'dots', 'item' => 'point', 'central' => 'columns',
+    'b_left' => 'chevron-left', 'b_right' => 'chevron-right',
+    'b_prevpage' => 'chevron-left', 'bd_prevpage' => 'chevron-left',
+    'b_nextpage' => 'chevron-right', 'bd_nextpage' => 'chevron-right',
+    'b_firstpage' => 'chevrons-left', 'bd_firstpage' => 'chevrons-left',
+    'b_lastpage' => 'chevrons-right', 'bd_lastpage' => 'chevrons-right',
+    'arrow_ltr' => 'arrow-right', 'arrow_rtl' => 'arrow-left',
+
+    'b_newdb' => 'database-plus', 'b_newtbl' => 'table-plus', 'b_snewtbl' => 'table-plus',
+    'b_table_add' => 'table-plus', 'b_view_add' => 'square-plus', 'b_view' => 'eye',
+    'b_views' => 'eye', 's_views' => 'eye', 'show' => 'eye', 'hide' => 'eye-off',
+    'eye' => 'eye', 'eye_grey' => 'eye', 'database' => 'database',
+    'b_index' => 'list-numbers', 'b_index_add' => 'list-numbers',
+    'bd_index' => 'list-numbers', 'b_primary' => 'key', 'bd_primary' => 'key',
+    'b_unique' => 'fingerprint', 'bd_unique' => 'fingerprint',
+    'b_spatial' => 'world', 'bd_spatial' => 'world',
+    'b_ftext' => 'letter-case', 'bd_ftext' => 'letter-case',
+    's_fulltext' => 'letter-case', 's_partialtext' => 'letter-case',
+    'b_relations' => 'binary-tree', 'b_props' => 'settings', 'b_tblops' => 'settings',
+    'b_tblanalyse' => 'chart-histogram', 'b_tbloptimize' => 'bolt',
+    'b_engine' => 'engine', 'b_plugin' => 'plug', 'b_group' => 'folder',
+    'b_versions' => 'history', 'b_report' => 'report', 'normalize' => 'wand',
+
+    'b_chart' => 'chart-line', 'b_dbstatistics' => 'chart-bar',
+
+    'b_routines' => 'math-function', 'b_routine_add' => 'math-function',
+    'bd_routine_add' => 'math-function', 'b_triggers' => 'bolt',
+    'b_trigger_add' => 'bolt', 'b_events' => 'calendar-event',
+    'b_event_add' => 'calendar-plus', 'b_calendar' => 'calendar',
+
+    'b_usradd' => 'user-plus', 'b_usrcheck' => 'user-check', 'b_usrdrop' => 'user-minus',
+    'b_usredit' => 'user-edit', 'b_usrlist' => 'users', 's_rights' => 'shield',
+    's_passwd' => 'key', 'b_key' => 'key', 's_lock' => 'lock', 's_unlock' => 'lock-open',
+    's_loggoff' => 'logout',
+
+    'b_bookmark' => 'bookmark', 'b_favorite' => 'star', 'b_no_favorite' => 'star-off',
+
+    's_asc' => 'sort-ascending', 's_asci' => 'sort-ascending',
+    'asc_order' => 'sort-ascending', 's_desc' => 'sort-descending',
+    's_sortable' => 'arrows-sort',
+
+    's_attention' => 'alert-triangle', 's_error' => 'alert-circle',
+    's_notice' => 'info-circle', 's_info' => 'info-circle',
+    's_okay' => 'circle-check', 's_success' => 'circle-check',
+    's_really' => 'help-circle', 's_cancel' => 'x', 's_cancel2' => 'x', 'b_close' => 'x',
+    's_status' => 'activity', 's_process' => 'activity',
+
+    's_cog' => 'settings', 's_db' => 'database', 's_host' => 'server', 's_tbl' => 'table',
+    's_lang' => 'language', 's_link' => 'link', 's_unlink' => 'unlink',
+    's_reload' => 'refresh', 's_sync' => 'refresh', 's_replication' => 'git-branch',
+    's_theme' => 'palette', 's_vars' => 'variable', 's_top' => 'arrow-up',
+    's_collapseall' => 'fold', 'b_plus' => 'plus', 'b_minus' => 'minus',
+    'pause' => 'player-pause', 'play' => 'player-play',
+
+    'new_data' => 'plus', 'new_data_hovered' => 'plus', 'new_data_selected' => 'plus',
+    'new_data_selected_hovered' => 'plus', 'new_struct' => 'plus',
+    'new_struct_hovered' => 'plus', 'new_struct_selected' => 'plus',
+    'new_struct_selected_hovered' => 'plus',
+];
+
+// Colour is a state, never decoration — the panel's rule, applied here too.
+$accent = ['b_edit', 'bd_edit', 'b_inline_edit', 'b_browse', 'bd_browse', 'b_sql',
+    'console', 'b_search', 'b_insrow', 'bd_insrow', 'b_newdb', 'b_newtbl', 'b_snewtbl',
+    'b_table_add', 'b_plus', 'b_save'];
+$danger = ['b_drop', 'bd_drop', 'b_deltbl', 'bd_deltbl', 'col_drop', 'db_drop',
+    'b_empty', 'bd_empty', 'b_usrdrop', 's_error', 's_cancel', 's_cancel2'];
+$good = ['s_okay', 's_success', 'b_usrcheck', 'play'];
+$warn = ['s_attention', 's_really', 'pause'];
+
+$dir = rtrim($argv[1], '/');
+$groups = [];
+
+foreach ($map as $pma => $tabler) {
+    $file = $dir . '/' . $tabler . '.svg';
+
+    if (!is_file($file)) {
+        continue;
+    }
+
+    $svg = (string) file_get_contents($file);
+    $svg = trim((string) preg_replace('/\s+/', ' ', $svg));
+
+    // Everything a mask does not read. A mask keys off alpha alone, so colours are dead
+    // weight, and width/height are redundant beside viewBox. stroke-width goes too or the
+    // root would carry it twice once ours is added, which is invalid XML and renders
+    // nothing at all.
+    $svg = (string) preg_replace('/\s(?:width|height|class|stroke-width)="[^"]*"/', '', $svg);
+    $svg = str_replace(['stroke="currentColor"', 'fill="none"'], '', $svg);
+    $svg = (string) preg_replace('#\s*<path stroke="none" d="M0 0h24v24H0z"\s*/>#', '', $svg);
+
+    // A stroked shape with no colour has no alpha, so give the root one, once.
+    $svg = (string) preg_replace('/<svg /', '<svg stroke="#000" fill="none" stroke-width="1.75" ', $svg, 1);
+
+    // Single quotes inside so the CSS url() keeps its double quotes and needs no escaping.
+    $svg = str_replace('"', "'", $svg);
+    $svg = trim((string) preg_replace('/\s+/', ' ', $svg));
+
+    // Only what a data URI in CSS cannot carry. Spaces stay raw: a quoted url() accepts
+    // them, and encoding each one as %20 added a fifth to the weight for nothing.
+    $uri = 'data:image/svg+xml,' . str_replace(['%', '#'], ['%25', '%23'], $svg);
+
+    $groups[$uri][] = $pma;
+}
+
+$out = [];
+
+foreach ($groups as $uri => $names) {
+    sort($names);
+    $sel = implode(",\n", array_map(static fn ($n) => '.ic_' . $n, $names));
+    $out[] = $sel . " {\n    -webkit-mask-image: url(\"" . $uri . "\");\n    mask-image: url(\"" . $uri . "\");\n}\n";
+}
+
+$tint = static function (array $names, string $colour, string $why) use ($map): string {
+    $names = array_values(array_filter($names, static fn ($n) => isset($map[$n])));
+
+    if ($names === []) {
+        return '';
+    }
+
+    sort($names);
+    $sel = implode(",\n", array_map(static fn ($n) => '.ic_' . $n, $names));
+
+    return "\n/* " . $why . " */\n" . $sel . " {\n    background-color: " . $colour . ";\n}\n";
+};
+
+$out[] = $tint($accent, 'var(--wy-accent)', 'the action you came to perform');
+$out[] = $tint($danger, '#F2555A', 'destroys something');
+$out[] = $tint($good, '#3FBF7F', 'it worked');
+$out[] = $tint($warn, '#E0A32E', 'stop and read');
+
+echo implode('', $out);
+PHPEOF
+
+    php "$WORK_DIR/icons.php" "$_svg_dir" >"$WORK_DIR/icons.css" 2>/dev/null
+
+    [ -s "$WORK_DIR/icons.css" ]
+}
+
 # A Wyvern skin for phpMyAdmin.
 #
 # Every theme it ships is compiled Bootstrap 5 with the full set of --bs-* custom
-# properties, so a dark Wyvern surface is a variable override rather than a port: copy the
-# flattest theme and append one block. It is a skin and not a pixel match for the panel —
-# phpMyAdmin has its own layout and always will — but it stops the jump from a dark panel
-# into a white page.
+# properties, so the colours are a variable override on a copy of the flattest theme
+# rather than a port. On top of that go three things that make it read as the same product
+# as the panel: the panel's typefaces, the panel's icon set, and the panel's spacing.
+#
+# It is still phpMyAdmin underneath, and its layout is its own.
 build_pma_theme() {
     _src="$PMA_DIR/themes/bootstrap"
     _dst="$PMA_DIR/themes/wyvern"
@@ -1365,21 +1594,50 @@ build_pma_theme() {
 {
     "name": "Wyvern",
     "version": "1.0",
-    "description": "Wyvern panel colours",
+    "description": "Wyvern panel colours, type and icons",
     "author": "Wyvern",
     "url": "https://github.com/PatocheOnGit/wyvern-installer",
     "supports": ["5.1", "5.2"]
 }
 EOF
 
+    _have_fonts=0
+    copy_pma_fonts "$_dst" && _have_fonts=1
+
+    _have_icons=0
+    build_pma_icons && _have_icons=1
+
     for _css in "$_dst/css/theme.css" "$_dst/css/theme.rtl.css"; do
         [ -f "$_css" ] || continue
+
+        if [ "$_have_fonts" -eq 1 ]; then
+            cat >>"$_css" <<'EOF'
+
+/* ------------------------------------------------------------------ Wyvern type
+   The panel's own faces, copied out of its build so both sides of the link read the
+   same. Variable weight, so one file covers the range. */
+@font-face {
+    font-family: "Instrument Sans Variable";
+    src: url("../fonts/instrument-sans.woff2") format("woff2-variations");
+    font-weight: 100 900;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: "JetBrains Mono Variable";
+    src: url("../fonts/jetbrains-mono.woff2") format("woff2-variations");
+    font-weight: 100 800;
+    font-display: swap;
+}
+EOF
+        fi
+
         cat >>"$_css" <<'EOF'
 
 /* ------------------------------------------------------------------ Wyvern skin
-   Appended by wyvern-installer. Colour means a state, never decoration: the surfaces
-   are warm neutrals, one cold accent carries affordance, and green/amber/red are kept
-   for what they mean everywhere else in the panel. */
+   Colour means a state, never decoration: the surfaces are warm neutrals, one cold
+   accent carries affordance, and green/amber/red are kept for what they mean
+   everywhere else in the panel. */
 :root,
 [data-bs-theme="light"],
 [data-bs-theme="dark"] {
@@ -1414,8 +1672,8 @@ EOF
     --bs-border-radius-sm: 6px;
     --bs-border-radius-lg: 8px;
     --bs-code-color: var(--wy-accent);
-    --bs-font-sans-serif: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    --bs-font-monospace: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --bs-font-sans-serif: "Instrument Sans Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --bs-font-monospace: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
     color-scheme: dark;
 }
 
@@ -1424,6 +1682,7 @@ body,
 .container-fluid {
     background-color: var(--wy-ground);
     color: var(--wy-text);
+    font-family: var(--bs-font-sans-serif);
 }
 
 /* The navigation rail and the top bar are the two surfaces that read as chrome. */
@@ -1530,6 +1789,7 @@ textarea#sqlquery {
 
 /* The navigation rail's own header is a separate surface, and it ships as a white block
    with a dark logo on it: the single most jarring thing left on a dark page. */
+#pmalogo,
 #pma_navigation_header,
 #pma_navigation_content,
 #pma_navigation_collapser,
@@ -1549,6 +1809,22 @@ textarea#sqlquery {
     opacity: 0.85;
 }
 
+/* The logo now links back to Wyvern's database picker, which nobody would guess from a
+   phpMyAdmin logo. Label it. */
+#pmalogo::after {
+    content: "← back to Wyvern";
+    display: block;
+    padding: 8px 0 2px;
+    font-size: 11px;
+    line-height: 1;
+    color: var(--wy-text-2);
+    letter-spacing: 0.02em;
+}
+
+#pmalogo:hover::after {
+    color: var(--wy-accent);
+}
+
 .alert,
 .alert-info,
 .alert-primary,
@@ -1565,10 +1841,13 @@ textarea#sqlquery {
 
 .breadcrumb,
 .card-header,
+.card-footer,
 .modal-header,
-.modal-footer {
-    background-color: var(--wy-raised);
-    border-color: var(--wy-line);
+.modal-footer,
+.list-group-item-action {
+    background-color: var(--wy-raised) !important;
+    border-color: var(--wy-line) !important;
+    color: var(--wy-text);
 }
 
 /* pmahomme-era gradients and tiled images survive in a few corners; flatten them so
@@ -1580,10 +1859,285 @@ th,
 .print_ignore {
     background-image: none !important;
 }
+
+/* ---------------------------------------------------------------- the rest of it
+
+   Everything below was found by walking the DOM of phpMyAdmin's own pages and asking
+   which elements actually compute to a light background or dark text, rather than by
+   looking at screenshots — which is how the console, the query box and a dozen black
+   labels survived the first pass. */
+
+/* The SQL console docked at the bottom. Hidden until you open it, and the single largest
+   white surface on every page when you do. */
+#pma_console_container,
+#pma_console,
+#pma_console .content,
+#pma_console .toolbar,
+#pma_console .templates,
+#pma_console .message,
+#pma_console .query_input,
+#pma_console_options,
+#debug_console,
+#debug_console .content,
+#debug_console .toolbar {
+    background-color: var(--wy-card) !important;
+    color: var(--wy-text);
+    border-color: var(--wy-line) !important;
+}
+
+#pma_console .button,
+#pma_console .button.order_by,
+#pma_console .button.order,
+#pma_console .switch_button,
+.drop_button,
+button.drop_button {
+    background-color: var(--wy-control) !important;
+    color: var(--wy-text) !important;
+    border-color: var(--wy-line) !important;
+}
+
+#pma_navigation_tree li.selected,
+#pma_navigation_tree li.database.selected,
+#pma_navigation_tree li.nav_node_table.last,
+#pma_navigation_tree .selected > a {
+    background-color: var(--wy-raised) !important;
+    color: var(--wy-text) !important;
+}
+
+/* Fieldsets and their legends wrap most forms, and ship as light grey panels. */
+fieldset,
+fieldset.pma-fieldset,
+legend,
+.pma-fieldset legend {
+    background-color: var(--wy-card) !important;
+    border-color: var(--wy-line) !important;
+    color: var(--wy-text);
+}
+
+/* The echoed query above a result set, and the action strip under it. */
+.sqlOuter,
+.tools,
+.result_query,
+#sqlqueryresultsouter .sqlOuter {
+    background-color: var(--wy-raised) !important;
+    border-color: var(--wy-line) !important;
+    /* !important on the colour too: phpMyAdmin styles this as div.tools.d-print-none,
+       which outranks a bare .tools selector and left the text black on a dark strip. */
+    color: var(--wy-text) !important;
+}
+
+.tools a,
+.tools button,
+.sqlOuter a {
+    color: var(--wy-accent) !important;
+}
+
+/* Black text that was only ever legible because the background used to be white. */
+div.block,
+div.block.second,
+label,
+.column_name,
+.crumb,
+dfn,
+caption {
+    color: var(--wy-text) !important;
+}
+
+/* Drawn as a background image rather than a glyph, so its `color` stays black whatever we
+   say; inverting the image is what actually makes it visible. */
+.navbar-toggler-icon {
+    filter: invert(1) opacity(0.75);
+}
+
+/* CodeMirror ships a light syntax theme: purple keywords and magenta operators on what is
+   now a dark editor. Re-cast in the panel's own colours, where hue still carries meaning —
+   accent for keywords, green for strings, amber for numbers, muted for comments. */
+.CodeMirror,
+.CodeMirror-gutters,
+.cm-s-default {
+    background-color: var(--wy-card) !important;
+    color: var(--wy-text) !important;
+    border-color: var(--wy-line) !important;
+    font-family: var(--bs-font-monospace);
+}
+
+.CodeMirror-gutters { border-right-color: var(--wy-line) !important; }
+.CodeMirror-linenumber { color: var(--wy-muted) !important; }
+.CodeMirror-cursor { border-left-color: var(--wy-text) !important; }
+.CodeMirror-selected { background-color: #2E3A4D !important; }
+
+.cm-keyword, .cm-builtin      { color: #5B92F5 !important; }
+.cm-string, .cm-string-2      { color: #3FBF7F !important; }
+.cm-number, .cm-atom          { color: #E0A32E !important; }
+.cm-comment                   { color: #78746D !important; font-style: italic; }
+.cm-operator, .cm-punctuation { color: #A8A39A !important; }
+.cm-variable, .cm-variable-2, .cm-variable-3 { color: #F2EFE9 !important; }
+.cm-error                     { color: #F2555A !important; }
+
+/* Inline SQL that phpMyAdmin pretty-prints outside the editor uses the same class names. */
+.syntax_alpha_reservedWord { color: #5B92F5 !important; }
+.syntax_quote              { color: #3FBF7F !important; }
+.syntax_digit              { color: #E0A32E !important; }
+.syntax_comment            { color: #78746D !important; }
+
+/* ------------------------------------------------------------------ Wyvern spacing
+
+   phpMyAdmin's layout is its own and stays that way, but the measurements that make a
+   page feel like one product — row height, radius, the weight of a hairline, where type
+   sits against it — are the panel's. */
+body {
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.card,
+.modal-content,
+fieldset,
+.pma-fieldset {
+    border-radius: 8px;
+    border-width: 1px;
+    box-shadow: none;
+}
+
+.btn,
+.form-control,
+.form-select,
+input[type="text"],
+input[type="password"],
+input[type="number"],
+select,
+textarea {
+    border-radius: 6px;
+    font-size: 13px;
+}
+
+.btn {
+    font-weight: 500;
+    padding: 6px 12px;
+}
+
+/* Data is read down a column, so rows are tight and numbers are monospaced: the same
+   reasoning as the panel's own tables. */
+.table > tbody > tr > td,
+.table > thead > tr > th,
+table.data > tbody > tr > td,
+table.data > thead > tr > th {
+    padding: 8px 10px;
+    border-color: var(--wy-line);
+    vertical-align: middle;
+}
+
+table.data > thead > tr > th,
+.table > thead > tr > th {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+}
+
+td.data,
+td .value,
+code.sql,
+.font_monospace,
+.value {
+    font-family: var(--bs-font-monospace);
+    font-size: 12.5px;
+}
+
+/* One hairline, one radius, no inner shadows — the panel's surfaces do not stack. */
+#page_content > .card,
+.card + .card {
+    margin-bottom: 12px;
+}
+
+#serverinfo {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--wy-line);
+    font-size: 12.5px;
+}
+
+#serverinfo .item {
+    color: var(--wy-text-2);
+}
+
+/* Greyed out has to mean dimmer than the text, not darker than the surface. phpMyAdmin
+   disables controls for good reasons — the first-page arrows when there is only one page —
+   and inherited light-theme greys turn those into black-on-black. */
+::placeholder {
+    color: var(--wy-muted) !important;
+    opacity: 1;
+}
+
+:disabled,
+.disabled,
+[aria-disabled="true"],
+input:disabled,
+select:disabled,
+button:disabled,
+.btn:disabled,
+.btn.disabled {
+    color: var(--wy-muted) !important;
+    background-color: var(--wy-card) !important;
+    border-color: var(--wy-line) !important;
+    opacity: 1;
+}
+
+:disabled .icon,
+.disabled .icon,
+.btn:disabled .icon {
+    background-color: var(--wy-muted) !important;
+}
 EOF
+
+        if [ "$_have_icons" -eq 1 ]; then
+            cat >>"$_css" <<'EOF'
+
+/* ------------------------------------------------------------------ Tabler icons
+   Generated from the panel's own Tabler set: phpMyAdmin draws each icon as a transparent
+   gif with the image applied by a .ic_* class, so the whole set is replaceable in CSS.
+   Each class becomes a mask over a solid colour, which is what lets an icon take the
+   panel's tokens instead of being black line art on a dark page. */
+.icon {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    font-size: 16px;
+    vertical-align: -0.18em;
+    background-image: none !important;
+    background-color: var(--wy-text-2);
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    -webkit-mask-position: center;
+    mask-position: center;
+    -webkit-mask-size: contain;
+    mask-size: contain;
+    image-rendering: auto;
+    filter: none !important;
+}
+
+a:hover .icon,
+button:hover .icon {
+    background-color: var(--wy-text);
+}
+
+/* The spinner is an animated gif and has to stay one. */
+.ic_ajax_clock_small {
+    background-color: transparent;
+    background-image: initial !important;
+    -webkit-mask-image: none;
+    mask-image: none;
+    filter: invert(1) opacity(0.8) !important;
+}
+EOF
+            cat "$WORK_DIR/icons.css" >>"$_css"
+        fi
     done
 
-    ok "phpMyAdmin skinned to match the panel"
+    if [ "$_have_icons" -eq 1 ]; then
+        ok "phpMyAdmin skinned to match the panel, with its type and icons"
+    else
+        ok "phpMyAdmin skinned to match the panel"
+    fi
 }
 
 # --------------------------------------------------------------------------- firewall
