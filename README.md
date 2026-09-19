@@ -80,8 +80,10 @@ both bound to `127.0.0.1`. Nothing runs in a container except game servers.
 
 Two database accounts are created. `wyvern` owns the panel's schema and nothing else.
 `wyvernhost` can create databases and users, which is what the panel's per-server database
-feature needs — register it in the admin area as a database host on `127.0.0.1:3306`, with
-the password from the credentials file. Nothing uses it until you do.
+feature needs — and it is **registered in the panel for you**, as a database host called
+"Local MariaDB" attached to the node. Creating a node without the host it will serve
+databases from leaves the install half-made: the account would exist, with exactly the right
+grants, and "give this server a database" would still be a dead button.
 
 ### Sessions and the cache do not share a database
 
@@ -93,30 +95,42 @@ installer inherits it.
 
 ## phpMyAdmin
 
-Optional, off by default, served at `/pma` on the same host as the panel.
-
-It is not protected by a password of its own. nginx asks the panel, on every request,
-whether the browser presenting these cookies is a signed-in root administrator:
+Optional, off by default. It is not a bare phpMyAdmin bolted onto the side: `/pma` is a
+page of the panel, and phpMyAdmin itself lives behind it at `/pma/app`.
 
 ```
-/pma  →  nginx auth_request  →  panel /wyvern/internal/pma-authorize  →  204 or 403
+/pma       →  panel page: the databases you can reach, pick one, give its password
+/pma/app   →  phpMyAdmin, already signed in as that database's MySQL user
 ```
 
-A 403 sends the visitor to the panel's login page. So there is no second credential to
-store, rotate or leak, and phpMyAdmin is unreachable to anyone who is not already an
-administrator of this panel. The subrequest is served by the panel over the same php-fpm
-socket, so it costs no extra process and no internal HTTP hop.
+Not signed in to the panel, you are sent to the login page. Signed in, you see your own
+databases — the ones created on your servers' Databases pages — and nothing else. Pick one,
+give **that database's** password, and phpMyAdmin opens as its MySQL user.
 
-The endpoint lives in the panel, in `src/Http/AuthorizePhpMyAdmin.php`, and needs panel
-**0.2.0 or newer**. On an older panel the subrequest 404s, nginx reads that as a refusal,
-and `/pma` simply stays shut — closed, not open, which is the right way for that to fail.
+Three things follow, and each is deliberate:
 
-**Not implemented yet:** a link from a server's database page that signs you straight into
-phpMyAdmin as that database's own user. It is possible — phpMyAdmin's `signon` auth type
-takes credentials from a PHP script, so a one-time token minted by the panel could hand
-over the per-server user — but it needs a token store and a credential path of its own, and
-it is not in this version. Today `/pma` asks for a MySQL account once you are through the
-gate.
+- **The password is asked for, never taken.** The panel stores it encrypted and could sign
+  you in silently, but then any open panel tab would be an open shell on every database its
+  owner has.
+- **Scoping is left to MySQL.** Each database user has rights over its own schema and
+  nothing else, so phpMyAdmin shows exactly that much without being told to hide anything.
+  A filter in the UI would be a weaker second copy of a rule the database already enforces.
+- **The handover is bound to the panel session.** phpMyAdmin asks its signon source who to
+  log in as on *every* request, so anything consumed by reading it works for one page and
+  then throws you back to the picker — which is exactly what the first version of this did.
+  The selection lives against the session instead, and the signon script forwards your
+  cookies so the panel resolves the same person it would anywhere else.
+
+nginx still asks the panel, on every `/pma/app` request, whether the visitor is signed in at
+all. That is the outer door; the picker and the MySQL grants are what decide the rest.
+
+phpMyAdmin is skinned to the panel's colours — a Wyvern theme built from the Bootstrap one
+it ships, since every phpMyAdmin theme is compiled Bootstrap 5 with the full set of CSS
+custom properties. It is a skin, not a pixel match: phpMyAdmin has its own layout and always
+will. It is also pinned to English, which it otherwise picks from `Accept-Language`.
+
+This needs panel **0.3.1 or newer**. Against anything older the page does not exist and
+`/pma` simply 404s — closed, not open, which is the right way for that to fail.
 
 ## After it finishes
 

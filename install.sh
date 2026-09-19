@@ -26,7 +26,7 @@ PANEL_DIR="${WYVERN_PANEL_DIR:-/var/www/wyvern}"
 CONF_DIR=/etc/wyvern
 DATA_DIR=/var/lib/wyvern
 PMA_PARENT=/var/www/wyvern-pma
-PMA_DIR="$PMA_PARENT/pma"
+PMA_DIR="$PMA_PARENT/pma/app"
 LOG_FILE=/var/log/wyvern-install.log
 CRED_FILE=/root/wyvern-credentials.txt
 WORK_DIR=
@@ -406,8 +406,8 @@ collect() {
     [ -n "$NODE_NAME" ] || NODE_NAME=$(ask "Node name for this machine" "$(hostname -s 2>/dev/null || echo local)")
 
     if [ -z "$INSTALL_PMA" ]; then
-        note "phpMyAdmin would be served at $PANEL_URL/pma, reachable only while you are"
-        note "signed in to the panel as an administrator. Otherwise nginx refuses it."
+        note "phpMyAdmin would be served at $PANEL_URL/pma: sign in to the panel, pick one"
+        note "of your databases, give its password, and land in phpMyAdmin as that user."
         INSTALL_PMA=$(ask_yn "Install phpMyAdmin?" n)
     fi
 
@@ -760,6 +760,10 @@ REDIS_PASSWORD=
 MAIL_MAILER=log
 MAIL_FROM_ADDRESS=$ADMIN_EMAIL
 MAIL_FROM_NAME=Wyvern
+
+# The panel cannot see whether /pma exists, because it is nginx that routes it. Without
+# this it would offer a database picker and a button leading to a 404.
+WYVERN_PMA_ENABLED=$([ "$INSTALL_PMA" = "y" ] && echo true || echo false)
 EOF
     chmod 640 "$PANEL_DIR/.env"
     ok ".env written"
@@ -864,15 +868,17 @@ nginx_pma_blocks() {
     [ "$INSTALL_PMA" = "y" ] || return 0
     cat <<EOF
 
-    # phpMyAdmin, gated by the panel session.
+    # phpMyAdmin, behind the panel.
     #
-    # nginx asks the panel, on every request to /pma, whether the browser presenting these
-    # cookies is a signed-in administrator. The panel answers 204 or 403 and nginx forwards
-    # or refuses accordingly, so phpMyAdmin is never reachable to anyone who is not already
-    # an administrator of this panel — no second password, and nothing to leak.
+    # /pma is the panel's own page: it lists the databases the visitor may open, takes the
+    # one they pick and its password, and hands phpMyAdmin a single-use token. It is a
+    # normal panel route, so it falls through to location / and is protected by the panel's
+    # own login like every other page.
     #
-    # The subrequest is served by the panel itself over the same php-fpm socket, so there
-    # is no extra process and no internal HTTP hop.
+    # /pma/app is phpMyAdmin itself, and nginx asks the panel on every request whether the
+    # browser presenting these cookies is signed in at all. That check is the outer door;
+    # which databases a visitor can actually reach is decided by the picker, and enforced
+    # after that by the MySQL user's own grants.
     location = /wyvern-internal/pma-authorize {
         internal;
         include fastcgi_params;
@@ -887,30 +893,33 @@ nginx_pma_blocks() {
         fastcgi_param CONTENT_LENGTH "";
     }
 
-    # A root, not an alias: nginx has a long-standing bug where try_files inside an
-    # aliased location resolves against the wrong path. phpMyAdmin therefore lives in
-    # $PMA_PARENT/pma, and /pma maps onto it by plain document root.
-    location ^~ /pma {
+    # A root, not an alias: nginx has a long-standing bug where try_files inside an aliased
+    # location resolves against the wrong path. phpMyAdmin therefore lives in
+    # $PMA_PARENT/pma/app, which /pma/app maps onto by plain document root. signon.php sits
+    # in $PMA_PARENT itself, one level above anything this block can serve, so it has no
+    # URL at all.
+    location ^~ /pma/app {
         auth_request /wyvern-internal/pma-authorize;
         error_page 401 403 = @pma_denied;
 
         root $PMA_PARENT;
         index index.php;
-        try_files \$uri \$uri/ /pma/index.php?\$query_string;
+        try_files \$uri \$uri/ /pma/app/index.php?\$query_string;
 
-        location ~ ^/pma/.+\.php\$ {
+        location ~ ^/pma/app/.+\.php\$ {
             root $PMA_PARENT;
             include fastcgi_params;
             fastcgi_pass unix:$PHP_SOCK;
             fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
             fastcgi_param HTTP_PROXY "";
+            fastcgi_read_timeout 300;
         }
     }
 
     # Not a 401 page: someone who is simply not signed in should be sent to sign in, which
     # is the only thing that would fix it.
     location @pma_denied {
-        return 302 $PANEL_URL/;
+        return 302 $PANEL_URL/login;
     }
 EOF
 }
@@ -1120,6 +1129,68 @@ EOF
     fi
 }
 
+# Register the privileged MySQL account as a database host, instead of leaving it in a
+# credentials file for someone to copy into a form.
+#
+# Without this, "give this server its own database" is a dead button on a fresh install:
+# the account exists and has exactly the right grants, but the panel does not know about
+# it. Creating a node without creating the host it will serve databases from leaves the
+# install half-made.
+register_database_host() {
+    step "Database host"
+
+    cat >"$WORK_DIR/dbhost.php" <<EOF
+<?php
+
+require '$PANEL_DIR/vendor/autoload.php';
+\$app = require '$PANEL_DIR/bootstrap/app.php';
+\$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+
+// The password arrives in the environment, never in this file: the file is world-readable
+// for the moment www-data needs it, and a credential written to disk outlives its use.
+\$password = getenv('WYVERN_DBH_PASSWORD');
+
+\$host = App\Models\DatabaseHost::query()
+    ->where('host', '127.0.0.1')
+    ->where('username', 'wyvernhost')
+    ->first() ?? new App\Models\DatabaseHost();
+
+\$host->fill([
+    'name' => 'Local MariaDB',
+    'host' => '127.0.0.1',
+    'port' => 3306,
+    'username' => 'wyvernhost',
+    'password' => \$password,
+])->save();
+
+// Scoped to this node, which is what decides whether the host is offered when someone
+// adds a database to a server running on it.
+\$node = App\Models\Node::first();
+if (\$node !== null) {
+    \$host->nodes()->syncWithoutDetaching([\$node->id]);
+}
+
+echo \$host->id;
+EOF
+
+    chmod 0755 "$WORK_DIR"
+    chmod 0644 "$WORK_DIR/dbhost.php"
+
+    _cmd="WYVERN_DBH_PASSWORD=$(shquote "$DB_HOST_PASS") php $(shquote "$WORK_DIR/dbhost.php")"
+    _host_id=$(cd "$PANEL_DIR" && su -s /bin/sh -c "$_cmd" www-data 2>&1) || {
+        printf '%s\n' "$_host_id" >>"$LOG_FILE"
+        warn "could not register the database host; add it by hand from the admin area."
+        rm -f "$WORK_DIR/dbhost.php"
+        chmod 0700 "$WORK_DIR"
+        return 0
+    }
+
+    rm -f "$WORK_DIR/dbhost.php"
+    chmod 0700 "$WORK_DIR"
+
+    ok "database host #$_host_id registered on 127.0.0.1:3306"
+}
+
 # --------------------------------------------------------------------------- phpmyadmin
 
 install_pma() {
@@ -1148,38 +1219,371 @@ install_pma() {
     run tar -xzf "$WORK_DIR/pma.tar.gz" -C "$PMA_DIR" --strip-components=1
     mkdir -p "$PMA_DIR/tmp"
 
+    write_pma_signon
+    write_pma_config
+    build_pma_theme
+
+    chown -R www-data:www-data "$PMA_PARENT"
+    chmod 640 "$PMA_DIR/config.inc.php" "$PMA_PARENT/signon.php"
+    chmod 700 "$PMA_DIR/tmp"
+
+    run nginx -t
+    run systemctl reload nginx
+    ok "phpMyAdmin $_pma_ver behind $PANEL_URL/pma"
+}
+
+# The bridge between the panel and phpMyAdmin.
+#
+# phpMyAdmin's signon auth calls this script to ask who it should log in as. The script
+# runs inside phpMyAdmin, which shares no session, no cache and no encryption key with the
+# panel — so it cannot look the answer up itself. It exchanges the single-use token in the
+# URL for credentials, over the loopback interface, and the panel destroys that token as it
+# reads it.
+#
+# It lives outside every document root on purpose: nginx serves $PMA_PARENT only under
+# /pma/app, so this file has no URL at all.
+write_pma_signon() {
+    cat >"$PMA_PARENT/signon.php" <<'PHPEOF'
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Written by wyvern-installer. phpMyAdmin sources this to obtain login credentials.
+ *
+ * It is called on every request phpMyAdmin serves, not once at login, so it cannot consume
+ * anything: it asks the panel afresh each time, forwarding the visitor's cookies so the
+ * panel resolves the same person it would for any other request. The panel answers with
+ * whichever database that person chose in the picker.
+ *
+ * Returning null makes phpMyAdmin send the visitor to SignonURL, which is that picker — so
+ * a direct visit, an expired panel session and a visitor who has chosen nothing all end in
+ * the same harmless place rather than at a MySQL login prompt.
+ */
+function get_login_credentials(?string $user): ?array
+{
+    $cookies = $_SERVER['HTTP_COOKIE'] ?? '';
+
+    if ($cookies === '') {
+        return null;
+    }
+
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'GET',
+            'timeout' => 5,
+            'ignore_errors' => true,
+            'header' => "Accept: application/json\r\n"
+                . 'Cookie: ' . str_replace(["\r", "\n"], '', $cookies) . "\r\n",
+        ],
+    ]);
+
+    $body = @file_get_contents('http://127.0.0.1/wyvern/internal/pma-claim', false, $context);
+
+    if ($body === false) {
+        return null;
+    }
+
+    $payload = json_decode($body, true);
+
+    if (!is_array($payload) || !isset($payload['username'], $payload['password'])) {
+        return null;
+    }
+
+    return [$payload['username'], $payload['password']];
+}
+PHPEOF
+}
+
+write_pma_config() {
     cat >"$PMA_DIR/config.inc.php" <<EOF
 <?php
-// Written by wyvern-installer. phpMyAdmin is reachable only through /pma, and nginx asks
-// the panel whether the visitor is a signed-in administrator before forwarding anything
-// here. This file therefore adds no login of its own beyond the MySQL one.
+
+// Written by wyvern-installer.
+//
+// phpMyAdmin has no login of its own here. Wyvern's database picker at /pma decides which
+// databases a visitor may open, takes that database's own password, and hands this a
+// single-use token; signon.php exchanges it for credentials. A visitor who arrives without
+// one is sent back to the picker.
+//
+// Nothing scopes the view to a single database, deliberately: the panel grants each
+// database user rights over its own schema only, so MySQL already shows exactly that much.
+// A second filter here would be a weaker copy of a rule the database enforces anyway.
 
 declare(strict_types=1);
 
 \$cfg['blowfish_secret'] = '$PMA_BLOWFISH';
 
 \$i = 1;
-\$cfg['Servers'][\$i]['auth_type'] = 'cookie';
+\$cfg['Servers'][\$i]['auth_type'] = 'signon';
+\$cfg['Servers'][\$i]['SignonScript'] = '$PMA_PARENT/signon.php';
+\$cfg['Servers'][\$i]['SignonURL'] = '/pma';
+\$cfg['Servers'][\$i]['LogoutURL'] = '/pma';
 \$cfg['Servers'][\$i]['host'] = '127.0.0.1';
 \$cfg['Servers'][\$i]['port'] = 3306;
 \$cfg['Servers'][\$i]['compress'] = false;
 \$cfg['Servers'][\$i]['AllowNoPassword'] = false;
 
+\$cfg['ThemeDefault'] = 'wyvern';
+\$cfg['ThemeManager'] = false;
+
+// Otherwise phpMyAdmin picks a language from Accept-Language, and a French browser gets a
+// French phpMyAdmin bolted onto an English panel.
+\$cfg['Lang'] = 'en';
+\$cfg['DefaultLang'] = 'en';
+
 \$cfg['TempDir'] = '$PMA_DIR/tmp';
 \$cfg['UploadDir'] = '';
 \$cfg['SaveDir'] = '';
+
+// Nothing here should advertise the host it runs on, or nag about updates it cannot apply.
 \$cfg['ShowServerInfo'] = false;
 \$cfg['VersionCheck'] = false;
+\$cfg['ShowPhpInfo'] = false;
+\$cfg['ShowChgPassword'] = false;
+\$cfg['SendErrorReports'] = 'never';
+EOF
+}
+
+# A Wyvern skin for phpMyAdmin.
+#
+# Every theme it ships is compiled Bootstrap 5 with the full set of --bs-* custom
+# properties, so a dark Wyvern surface is a variable override rather than a port: copy the
+# flattest theme and append one block. It is a skin and not a pixel match for the panel —
+# phpMyAdmin has its own layout and always will — but it stops the jump from a dark panel
+# into a white page.
+build_pma_theme() {
+    _src="$PMA_DIR/themes/bootstrap"
+    _dst="$PMA_DIR/themes/wyvern"
+
+    [ -d "$_src" ] || { warn "no bootstrap theme to base the Wyvern skin on; keeping the default."; return 0; }
+
+    rm -rf "$_dst"
+    cp -r "$_src" "$_dst"
+
+    cat >"$_dst/theme.json" <<'EOF'
+{
+    "name": "Wyvern",
+    "version": "1.0",
+    "description": "Wyvern panel colours",
+    "author": "Wyvern",
+    "url": "https://github.com/PatocheOnGit/wyvern-installer",
+    "supports": ["5.1", "5.2"]
+}
 EOF
 
-    chown -R www-data:www-data "$PMA_DIR"
-    chmod 640 "$PMA_DIR/config.inc.php"
-    chmod 700 "$PMA_DIR/tmp"
+    for _css in "$_dst/css/theme.css" "$_dst/css/theme.rtl.css"; do
+        [ -f "$_css" ] || continue
+        cat >>"$_css" <<'EOF'
 
-    run nginx -t
-    run systemctl reload nginx
-    ok "phpMyAdmin $_pma_ver at $PANEL_URL/pma"
-    note "Sign in with wyvernhost, or any other MySQL account on this machine."
+/* ------------------------------------------------------------------ Wyvern skin
+   Appended by wyvern-installer. Colour means a state, never decoration: the surfaces
+   are warm neutrals, one cold accent carries affordance, and green/amber/red are kept
+   for what they mean everywhere else in the panel. */
+:root,
+[data-bs-theme="light"],
+[data-bs-theme="dark"] {
+    --wy-ground: #0A0908;
+    --wy-card: #121110;
+    --wy-raised: #1A1917;
+    --wy-control: #232220;
+    --wy-line: #2C2A27;
+    --wy-text: #F2EFE9;
+    --wy-text-2: #A8A39A;
+    --wy-muted: #78746D;
+    --wy-accent: #5B92F5;
+
+    --bs-body-bg: var(--wy-ground);
+    --bs-body-bg-rgb: 10, 9, 8;
+    --bs-body-color: var(--wy-text);
+    --bs-body-color-rgb: 242, 239, 233;
+    --bs-emphasis-color: #FFFFFF;
+    --bs-secondary-color: var(--wy-text-2);
+    --bs-secondary-bg: var(--wy-raised);
+    --bs-tertiary-color: var(--wy-muted);
+    --bs-tertiary-bg: var(--wy-card);
+    --bs-border-color: var(--wy-line);
+    --bs-border-color-translucent: var(--wy-line);
+    --bs-primary: var(--wy-accent);
+    --bs-primary-rgb: 91, 146, 245;
+    --bs-link-color: var(--wy-accent);
+    --bs-link-color-rgb: 91, 146, 245;
+    --bs-link-hover-color: #8AB2F8;
+    --bs-heading-color: var(--wy-text);
+    --bs-border-radius: 8px;
+    --bs-border-radius-sm: 6px;
+    --bs-border-radius-lg: 8px;
+    --bs-code-color: var(--wy-accent);
+    --bs-font-sans-serif: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --bs-font-monospace: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    color-scheme: dark;
+}
+
+body,
+#page_content,
+.container-fluid {
+    background-color: var(--wy-ground);
+    color: var(--wy-text);
+}
+
+/* The navigation rail and the top bar are the two surfaces that read as chrome. */
+#pma_navigation,
+#pma_navigation_tree,
+.navbar,
+#topmenu {
+    background-color: var(--wy-card) !important;
+    border-color: var(--wy-line) !important;
+    color: var(--wy-text);
+}
+
+#pma_navigation a,
+#topmenu a,
+.nav-link {
+    color: var(--wy-text-2);
+}
+
+#pma_navigation a:hover,
+#topmenu a:hover,
+.nav-link:hover {
+    color: var(--wy-text);
+}
+
+.card,
+.modal-content,
+.dropdown-menu,
+.list-group-item,
+.accordion-item {
+    background-color: var(--wy-card);
+    border-color: var(--wy-line);
+    color: var(--wy-text);
+}
+
+.table {
+    --bs-table-bg: transparent;
+    --bs-table-color: var(--wy-text);
+    --bs-table-border-color: var(--wy-line);
+    --bs-table-striped-bg: var(--wy-card);
+    --bs-table-striped-color: var(--wy-text);
+    --bs-table-hover-bg: var(--wy-raised);
+    --bs-table-hover-color: var(--wy-text);
+}
+
+.table > thead th,
+th.draggable {
+    background-color: var(--wy-raised);
+    color: var(--wy-text-2);
+    border-color: var(--wy-line);
+    font-weight: 600;
+}
+
+.form-control,
+.form-select,
+input[type="text"],
+input[type="password"],
+input[type="number"],
+textarea,
+select {
+    background-color: var(--wy-control);
+    border-color: var(--wy-line);
+    color: var(--wy-text);
+}
+
+.form-control:focus,
+.form-select:focus,
+input:focus,
+textarea:focus,
+select:focus {
+    background-color: var(--wy-control);
+    border-color: var(--wy-accent);
+    color: var(--wy-text);
+    box-shadow: 0 0 0 2px rgba(91, 146, 245, 0.35);
+}
+
+.btn-primary {
+    --bs-btn-bg: var(--wy-accent);
+    --bs-btn-border-color: var(--wy-accent);
+    --bs-btn-hover-bg: #4A80E0;
+    --bs-btn-hover-border-color: #4A80E0;
+    --bs-btn-color: #0A0908;
+    --bs-btn-hover-color: #0A0908;
+}
+
+.btn-secondary,
+.btn-light,
+.btn-outline-secondary {
+    --bs-btn-bg: var(--wy-control);
+    --bs-btn-border-color: var(--wy-line);
+    --bs-btn-color: var(--wy-text);
+    --bs-btn-hover-bg: var(--wy-raised);
+    --bs-btn-hover-border-color: var(--wy-line);
+    --bs-btn-hover-color: var(--wy-text);
+}
+
+pre,
+code,
+.CodeMirror,
+textarea#sqlquery {
+    background-color: var(--wy-card);
+    color: var(--wy-text);
+    border-color: var(--wy-line);
+}
+
+/* The navigation rail's own header is a separate surface, and it ships as a white block
+   with a dark logo on it: the single most jarring thing left on a dark page. */
+#pma_navigation_header,
+#pma_navigation_content,
+#pma_navigation_collapser,
+#pma_navigation_tree_content,
+.navigation_separator,
+#serverinfo,
+#page_nav_icons {
+    background-color: var(--wy-card) !important;
+    border-color: var(--wy-line) !important;
+    color: var(--wy-text);
+}
+
+/* The logo is a dark-on-transparent image. Inverting beats shipping our own copy, which
+   would have to be re-made every time phpMyAdmin changes it. */
+#imgpmalogo {
+    filter: brightness(0) invert(1);
+    opacity: 0.85;
+}
+
+.alert,
+.alert-info,
+.alert-primary,
+.alert-secondary {
+    background-color: var(--wy-raised);
+    border-color: var(--wy-line);
+    color: var(--wy-text-2);
+}
+
+/* Status still means status: these keep their colour, and only their surface changes. */
+.alert-success { border-color: #3FBF7F; color: #8ED9B0; }
+.alert-warning { border-color: #E0A32E; color: #E8C479; }
+.alert-danger  { border-color: #F2555A; color: #F79093; }
+
+.breadcrumb,
+.card-header,
+.modal-header,
+.modal-footer {
+    background-color: var(--wy-raised);
+    border-color: var(--wy-line);
+}
+
+/* pmahomme-era gradients and tiled images survive in a few corners; flatten them so
+   they do not sit as light strips on a dark page. */
+#serverinfo,
+.tabs,
+.tabLinks,
+th,
+.print_ignore {
+    background-image: none !important;
+}
+EOF
+    done
+
+    ok "phpMyAdmin skinned to match the panel"
 }
 
 # --------------------------------------------------------------------------- firewall
@@ -1315,8 +1719,8 @@ summary() {
         printf 'Password         %s\n\n' "$_pw_line"
         printf 'Panel database   %s / %s: %s\n' "$DB_NAME" "$DB_USER" "$DB_PASS"
         printf 'Database host    wyvernhost: %s\n' "${DB_HOST_PASS:-not created}"
-        printf '                 (register this as a database host in the admin area, on\n'
-        printf '                  127.0.0.1:3306, to give each game server its own database)\n\n'
+        printf '                 (already registered in the panel as "Local MariaDB", so servers\n'
+        printf '                  can be given their own databases straight away)\n\n'
         if [ "$INSTALL_PMA" = "y" ]; then
             printf 'phpMyAdmin       %s/pma — only reachable while signed in to the panel\n\n' "$PANEL_URL"
         fi
@@ -1405,9 +1809,15 @@ main() {
     setup_nginx
     install_pma
     [ "$SKIP_WINGS" -eq 0 ] && install_wings
+    register_database_host
     setup_firewall
     smoke_test
     summary
 }
 
-main "$@"
+# Sourcing the script defines its functions without running an install, which is how the
+# pieces get exercised one at a time — against a machine that already has a panel on it,
+# where running the whole thing would refuse.
+if [ "${WYVERN_INSTALLER_SOURCE_ONLY:-0}" != "1" ]; then
+    main "$@"
+fi
